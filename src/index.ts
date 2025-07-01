@@ -57,14 +57,19 @@ const INACTIVE_CHANNEL_ID = process.env.INACTIVE_CHANNEL_ID;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const MESSAGE_CRAWLING_ID = process.env.MESSAGE_CRAWLING_ID;
 const CLIENT_ID = process.env.CLIENT_ID; // アプリケーションIDが必要
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID; // 管理者ユーザーID
 
 if (!INACTIVE_CHANNEL_ID || !DISCORD_BOT_TOKEN || !MESSAGE_CRAWLING_ID || !CLIENT_ID) {
     console.error('One or more environment variables are not defined in .env file.');
     console.error('Required: INACTIVE_CHANNEL_ID, DISCORD_BOT_TOKEN, MESSAGE_CRAWLING_ID, CLIENT_ID');
+    console.error('Optional: ADMIN_USER_ID (for crawling command restrictions)');
     process.exit(1);
 }
 
 const userMuteStartTime = new Map<string, number>();
+
+// 自動応答の設定
+let autoResponseMode: 'mention_only' | 'random' | 'disabled' = 'random';
 
 // スラッシュコマンドの定義
 const commands = [
@@ -87,10 +92,28 @@ const commands = [
                 .setRequired(false)
                 .setMinValue(10)
                 .setMaxValue(200)
+        )
+        .addStringOption(option =>
+            option.setName('input')
+                .setDescription('この文章を元に応答を生成します（省略時はランダム生成）')
+                .setRequired(false)
         ),
     new SlashCommandBuilder()
         .setName('stats')
-        .setDescription('データベースの統計情報を表示します')
+        .setDescription('データベースの統計情報を表示します'),
+    new SlashCommandBuilder()
+        .setName('autoresponse')
+        .setDescription('自動応答機能の設定を変更します')
+        .addStringOption(option =>
+            option.setName('mode')
+                .setDescription('自動応答モード')
+                .setRequired(true)
+                .addChoices(
+                    { name: '有効（メンション時のみ）', value: 'mention_only' },
+                    { name: '有効（ランダム応答あり）', value: 'random' },
+                    { name: '無効', value: 'disabled' }
+                )
+        )
 ].map(command => command.toJSON());
 
 // スラッシュコマンドの登録
@@ -100,12 +123,23 @@ async function deployCommands() {
     try {
         console.log('Started refreshing application (/) commands.');
 
-        await rest.put(
-            Routes.applicationCommands(CLIENT_ID!),
-            { body: commands },
-        );
-
-        console.log('Successfully reloaded application (/) commands.');
+        // テスト用：特定のギルド（サーバー）にコマンドを登録（即座に反映）
+        const GUILD_ID = process.env.GUILD_ID; // .envに追加
+        
+        if (GUILD_ID) {
+            await rest.put(
+                Routes.applicationGuildCommands(CLIENT_ID!, GUILD_ID),
+                { body: commands },
+            );
+            console.log('Successfully reloaded guild-specific (/) commands.');
+        } else {
+            // グローバルコマンド（反映に時間がかかる）
+            await rest.put(
+                Routes.applicationCommands(CLIENT_ID!),
+                { body: commands },
+            );
+            console.log('Successfully reloaded global (/) commands.');
+        }
     } catch (error) {
         console.error('Error deploying commands:', error);
     }
@@ -196,7 +230,89 @@ async function generateMarkovSentence(maxWords = 50): Promise<string> {
     }
 }
 
+async function generateResponseFromMessage(inputMessage: string, maxWords = 50): Promise<string> {
+    try {
+        if (!tokenizer) {
+            return "トークナイザーが準備できていません。";
+        }
+
+        // 入力メッセージをトークン化
+        const tokens = tokenizer.tokenize(inputMessage);
+        const words = tokens.map((t: any) => t.surface_form);
+        
+        if (words.length < 2) {
+            // 短すぎる場合はランダム生成
+            return await generateMarkovSentence(maxWords);
+        }
+
+        // 入力メッセージの最後の2単語を取得
+        const lastTwoWords = words.slice(-2);
+        let prefix1 = lastTwoWords[0];
+        let prefix2 = lastTwoWords[1] || "";
+
+        // 入力の最後の単語から始まる連鎖を探す
+        let startCandidates = dbAll('SELECT prefix1, prefix2 FROM markov_chain WHERE prefix1 = ? OR prefix2 = ?', [prefix1, prefix2]);
+        
+        // 候補がない場合は、入力メッセージの任意の単語を使用
+        if (startCandidates.length === 0) {
+            for (const word of words) {
+                startCandidates = dbAll('SELECT prefix1, prefix2 FROM markov_chain WHERE prefix1 = ? OR prefix2 = ?', [word, word]);
+                if (startCandidates.length > 0) {
+                    break;
+                }
+            }
+        }
+
+        // それでも見つからない場合はランダム生成
+        if (startCandidates.length === 0) {
+            return await generateMarkovSentence(maxWords);
+        }
+
+        // ランダムに開始点を選択
+        const startPoint = startCandidates[Math.floor(Math.random() * startCandidates.length)];
+        prefix1 = startPoint.prefix1;
+        prefix2 = startPoint.prefix2;
+
+        const sentence = [prefix1, prefix2];
+
+        // マルコフ連鎖で文章を生成
+        for (let i = 0; i < maxWords; i++) {
+            const suffixes = dbAll('SELECT suffix FROM markov_chain WHERE prefix1 = ? AND prefix2 = ?', [prefix1, prefix2]);
+            if (suffixes.length === 0) {
+                break;
+            }
+
+            const nextSuffix = suffixes[Math.floor(Math.random() * suffixes.length)].suffix;
+            sentence.push(nextSuffix);
+
+            prefix1 = prefix2;
+            prefix2 = nextSuffix;
+        }
+
+        const result = sentence.join('');
+        
+        // 結果が短すぎる場合は再試行
+        if (result.length < 10) {
+            return await generateMarkovSentence(maxWords);
+        }
+
+        return result;
+    } catch (error) {
+        console.error("Error generating response from message:", error);
+        return "応答の生成中にエラーが発生しました。";
+    }
+}
+
 async function handleCrawlingCommand(interaction: ChatInputCommandInteraction) {
+    // 管理者権限チェック
+    if (ADMIN_USER_ID && interaction.user.id !== ADMIN_USER_ID) {
+        await interaction.reply({ 
+            content: '❌ このコマンドは管理者のみ実行できます。', 
+            ephemeral: true 
+        });
+        return;
+    }
+
     if (!tokenizer) {
         await interaction.reply({ content: 'Tokenizer is not ready yet. Please wait a moment and try again.', ephemeral: true });
         return;
@@ -211,7 +327,7 @@ async function handleCrawlingCommand(interaction: ChatInputCommandInteraction) {
     }
 
     await interaction.reply(`🔍 クロールを開始しました... ${messageCount}件のメッセージを取得します。しばらくお待ちください。`);
-    console.log(`Crawling started for ${messageCount} messages...`);
+    console.log(`Crawling started for ${messageCount} messages by user: ${interaction.user.tag} (${interaction.user.id})`);
 
     let lastId: string | undefined;
     const allMessages: Message[] = [];
@@ -300,11 +416,21 @@ async function handleCrawlingCommand(interaction: ChatInputCommandInteraction) {
 
 async function handleGenerateCommand(interaction: ChatInputCommandInteraction) {
     const maxWords = interaction.options.getInteger('length') ?? 50;
+    const inputText = interaction.options.getString('input');
     
     await interaction.deferReply();
     
     try {
-        const sentence = await generateMarkovSentence(maxWords);
+        let sentence: string;
+        
+        if (inputText) {
+            // 入力テキストを元に応答生成
+            sentence = await generateResponseFromMessage(inputText, maxWords);
+        } else {
+            // ランダム生成
+            sentence = await generateMarkovSentence(maxWords);
+        }
+        
         await interaction.editReply(`🤖 生成された文章:\n\n${sentence}`);
     } catch (error) {
         console.error('Error generating sentence:', error);
@@ -312,23 +438,33 @@ async function handleGenerateCommand(interaction: ChatInputCommandInteraction) {
     }
 }
 
-async function handleStatsCommand(interaction: ChatInputCommandInteraction) {
-    try {
-        const totalChains = dbGet('SELECT COUNT(*) as count FROM markov_chain', []);
-        const uniquePrefixes = dbGet('SELECT COUNT(DISTINCT prefix1 || prefix2) as count FROM markov_chain', []);
-        
-        await interaction.reply(`📈 **データベース統計**\n🔗 総マルコフ連鎖数: ${totalChains?.count || 0}\n🏷️ ユニークなプレフィックス数: ${uniquePrefixes?.count || 0}`);
-    } catch (error) {
-        console.error('Error getting stats:', error);
-        await interaction.reply({ content: '❌ データベース統計の取得中にエラーが発生しました。', ephemeral: true });
-    }
+async function handleAutoResponseCommand(interaction: ChatInputCommandInteraction) {
+    const mode = interaction.options.getString('mode') as 'mention_only' | 'random' | 'disabled';
+    
+    autoResponseMode = mode;
+    
+    const modeDescriptions = {
+        'mention_only': '🔔 メンション時のみ自動応答',
+        'random': '🎲 ランダム自動応答有効（50%の確率 + メンション時）',
+        'disabled': '🔕 自動応答無効'
+    };
+    
+    await interaction.reply(`⚙️ 自動応答設定を変更しました: ${modeDescriptions[mode]}`);
 }
+
+// 新しいhandleStatsCommand関数は上記で既に更新済み
 
 // スラッシュコマンドの処理
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
+    console.log('Interaction received:', interaction.type, interaction.user.tag);
+    
+    if (!interaction.isChatInputCommand()) {
+        console.log('Not a chat input command');
+        return;
+    }
 
     const { commandName } = interaction;
+    console.log('Slash command received:', commandName);
 
     try {
         switch (commandName) {
@@ -338,8 +474,8 @@ client.on('interactionCreate', async (interaction) => {
             case 'generate':
                 await handleGenerateCommand(interaction);
                 break;
-            case 'stats':
-                await handleStatsCommand(interaction);
+            case 'autoresponse':
+                await handleAutoResponseCommand(interaction);
                 break;
             default:
                 await interaction.reply({ content: '不明なコマンドです。', ephemeral: true });
@@ -357,7 +493,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-// 既存のメッセージコマンドも保持（下位互換性のため）
+// 既存のメッセージコマンドも保持（下位互換性のため）+ 自動応答機能
 client.on('messageCreate', async (message: Message) => {
     const { channel } = message;
     if (message.author.bot || !channel.isTextBased()) {
@@ -367,10 +503,45 @@ client.on('messageCreate', async (message: Message) => {
     // 下位互換性のため、従来のコマンドも残す
     if (message.content === '!crawling') {
         await message.reply('このコマンドはスラッシュコマンドに移行しました。`/crawling` を使用してください。');
+        return;
     } else if (message.content === '!generate') {
         await message.reply('このコマンドはスラッシュコマンドに移行しました。`/generate` を使用してください。');
+        return;
     } else if (message.content === '!stats') {
         await message.reply('このコマンドはスラッシュコマンドに移行しました。`/stats` を使用してください。');
+        return;
+    }
+
+    // 自動応答機能（設定に応じて反応）
+    if (autoResponseMode !== 'disabled' && message.content.length > 5) {
+        const isMentioned = message.mentions.has(client.user!);
+        const shouldRespond = isMentioned || (autoResponseMode === 'random' && Math.random() < 0.5);
+        
+        if (shouldRespond) {
+            try {
+                // タイピング表示を開始
+                if("sendTyping" in channel){
+                    await channel.sendTyping();
+                }
+                
+                // 少し待機（自然な感じにするため）
+                setTimeout(async () => {
+                    const response = await generateResponseFromMessage(message.content);
+                    
+                    // メンションされた場合は返信、そうでなければ通常のメッセージ
+                    if (isMentioned) {
+                        await message.reply(response);
+                    } else {
+                        if("send" in message.channel) {
+                            await message.channel.send(response);
+                        }
+                    }
+                }, Math.random() * 2000 + 1000); // 1-3秒のランダムな遅延
+                
+            } catch (error) {
+                console.error('Error in auto-response:', error);
+            }
+        }
     }
 });
 
